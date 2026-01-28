@@ -1,5 +1,5 @@
 #include <stdio.h>
-#inlcude "helper_cuda.h"
+#include "helper_cuda.h"
 
 // __global__ attribute tells the nvidia compiler
 // that this function can run the device(aka gpu)
