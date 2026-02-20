@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventElapsedTime(&ms_total, start, stop));
   float ms = ms_total / iters;
 
-  // FLOPs for GEMM: approx 2*M*N*K (+ M*N for beta*C add;这里 beta=0 默认影响不大)
+  // FLOPs for GEMM: approx 2*M*N*K 
   double flops = 2.0 * (double)M * (double)N * (double)K + 1.0 * (double)M * (double)N;
   double gflops = flops / (ms * 1e-3) / 1e9;
 

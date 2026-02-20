@@ -3,6 +3,7 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
+// Kernel 5: 2D block tiling with register accumulation
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void sgemm2DBlocktiling(int M, int N, int K, float alpha,
                                   const float* A, const float* B, float beta,
