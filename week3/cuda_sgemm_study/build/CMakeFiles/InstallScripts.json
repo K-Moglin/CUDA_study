@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/K_Moglin/CUDA_study/week3/cuda_sgemm_study/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
