@@ -12,47 +12,67 @@
 #endif
 
 // -------------------------
-// Simple block reductions (max, sum)
+// Simple warp/block reductions (max, sum)
 // -------------------------
 __inline__ __device__ float warpReduceMax(float v) {
-  for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+  for (int off = 16; off > 0; off >>= 1) {
+    v = fmaxf(v, __shfl_down_sync(0xffffffff, v, off));
+  }
   return v;
 }
+
 __inline__ __device__ float warpReduceSum(float v) {
-  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+  for (int off = 16; off > 0; off >>= 1) {
+    v += __shfl_down_sync(0xffffffff, v, off);
+  }
   return v;
 }
+
 __inline__ __device__ float blockReduceMax(float v) {
-  __shared__ float smem[32];
-  int lane = threadIdx.x & 31;
-  int wid  = threadIdx.x >> 5;
+  __shared__ float smem[32];       // up to 1024 threads -> 32 warps
+  __shared__ float block_result;   // final result visible to all threads
+
+  const int lane = threadIdx.x & 31;
+  const int wid  = threadIdx.x >> 5;
+  const int num_warps = (blockDim.x + 31) >> 5;  // ceil(blockDim.x / 32)
 
   v = warpReduceMax(v);
+
   if (lane == 0) smem[wid] = v;
   __syncthreads();
 
-  float out = -CUDART_INF_F;
   if (wid == 0) {
-    out = (threadIdx.x < (blockDim.x >> 5)) ? smem[lane] : -CUDART_INF_F;
+    float out = (lane < num_warps) ? smem[lane] : -CUDART_INF_F;
     out = warpReduceMax(out);
+    if (lane == 0) block_result = out;
   }
-  return __shfl_sync(0xffffffff, out, 0);
+  __syncthreads();
+
+  return block_result;
 }
+
+// Correct block-wide sum reduction.
 __inline__ __device__ float blockReduceSum(float v) {
   __shared__ float smem[32];
-  int lane = threadIdx.x & 31;
-  int wid  = threadIdx.x >> 5;
+  __shared__ float block_result;
+
+  const int lane = threadIdx.x & 31;
+  const int wid  = threadIdx.x >> 5;
+  const int num_warps = (blockDim.x + 31) >> 5;  // ceil(blockDim.x / 32)
 
   v = warpReduceSum(v);
+
   if (lane == 0) smem[wid] = v;
   __syncthreads();
 
-  float out = 0.f;
   if (wid == 0) {
-    out = (threadIdx.x < (blockDim.x >> 5)) ? smem[lane] : 0.f;
+    float out = (lane < num_warps) ? smem[lane] : 0.f;
     out = warpReduceSum(out);
+    if (lane == 0) block_result = out;
   }
-  return __shfl_sync(0xffffffff, out, 0);
+  __syncthreads();
+
+  return block_result;
 }
 
 // -------------------------
@@ -61,7 +81,7 @@ __inline__ __device__ float blockReduceSum(float v) {
 // - FP32
 // - One CUDA block computes one row i (for clarity).
 //
-// Uses CuTe to build tensors with explicit LayoutRight (row-major):
+// Uses CuTe to build tensors with explicit row-major layout:
 //   Q: (N,d) stride (d,1)
 //   K: (N,d) stride (d,1)
 //   V: (N,d) stride (d,1)
@@ -94,24 +114,25 @@ __global__ void fa2_alg1_forward_cute_rowwise(
   const int i = (int)blockIdx.x;
   if (i >= N) return;
 
-  // Build CuTe tensors (dynamic shapes/strides)
-  auto layout2d = make_layout(make_shape(N, d), make_stride(d, 1)); // row-major
+  // Build CuTe tensors (dynamic shapes/strides), row-major
+  auto layout2d = make_layout(make_shape(N, d), make_stride(d, 1));
   auto gQ = make_tensor(make_gmem_ptr(Qp), layout2d);
   auto gK = make_tensor(make_gmem_ptr(Kp), layout2d);
   auto gV = make_tensor(make_gmem_ptr(Vp), layout2d);
   auto gO = make_tensor(make_gmem_ptr(Op), layout2d);
-
   auto gL = make_tensor(make_gmem_ptr(Lp), make_layout(make_shape(N), make_stride(1)));
 
   const float inv_sqrt_d = rsqrtf((float)d);
 
+  // Shared storage for this tile
   __shared__ float sh_scores[Bc];
   __shared__ float sh_probs[Bc];
 
+  // Running softmax state for row i
   float m = -CUDART_INF_F;
   float l = 0.f;
 
-  // Use gO row i as Otilde buffer (register-strided update)
+  // Use gO(i, :) as Otilde buffer during accumulation
   for (int k = threadIdx.x; k < d; k += BLOCK_THREADS) {
     gO(i, k) = 0.f;
   }
@@ -122,7 +143,7 @@ __global__ void fa2_alg1_forward_cute_rowwise(
   for (int t = 0; t < tiles; ++t) {
     const int j0 = t * Bc;
 
-    // 1) scores for this tile
+    // 1) Compute scores for current tile
     if (threadIdx.x < Bc) {
       const int j = j0 + threadIdx.x;
       float s = -CUDART_INF_F;
@@ -138,31 +159,33 @@ __global__ void fa2_alg1_forward_cute_rowwise(
     }
     __syncthreads();
 
-    // 2) tile max
+    // 2) Tile max
     float local_max = -CUDART_INF_F;
     if (threadIdx.x < Bc) local_max = sh_scores[threadIdx.x];
     float tile_m = blockReduceMax(local_max);
 
+    // Fully masked tile: skip
     if (!isfinite(tile_m)) {
       __syncthreads();
       continue;
     }
 
-    // 3) update m, rescale old accumulators
-    float m_old = m;
-    float m_new = fmaxf(m_old, tile_m);
-    float scale_old = isfinite(m_old) ? expf(m_old - m_new) : 0.f;
+    // 3) Update running max and rescale previous accumulators
+    const float m_old = m;
+    const float m_new = fmaxf(m_old, tile_m);
+    const float scale_old = isfinite(m_old) ? expf(m_old - m_new) : 0.f;
 
     l *= scale_old;
+
     for (int k = threadIdx.x; k < d; k += BLOCK_THREADS) {
       gO(i, k) *= scale_old;
     }
     __syncthreads();
 
-    // 4) probs + tile sum
+    // 4) Compute probabilities and tile_l
     if (threadIdx.x < Bc) {
-      float sj = sh_scores[threadIdx.x];
-      float p = isfinite(sj) ? expf(sj - m_new) : 0.f;
+      const float sj = sh_scores[threadIdx.x];
+      const float p = isfinite(sj) ? expf(sj - m_new) : 0.f;
       sh_probs[threadIdx.x] = p;
     }
     __syncthreads();
@@ -176,28 +199,40 @@ __global__ void fa2_alg1_forward_cute_rowwise(
       float acc = gO(i, k);
       #pragma unroll
       for (int cj = 0; cj < Bc; ++cj) {
-        int j = j0 + cj;
+        const int j = j0 + cj;
         if (j >= N) break;
-        float pj = sh_probs[cj];
-        if (pj != 0.f) acc += pj * gV(j, k);
+        const float pj = sh_probs[cj];
+        if (pj != 0.f) {
+          acc += pj * gV(j, k);
+        }
       }
       gO(i, k) = acc;
     }
     __syncthreads();
 
+    // 6) Update running state
     l += tile_l;
     m = m_new;
     __syncthreads();
   }
 
-  // finalize
+  // Finalize
   if (!(l > 0.f) || !isfinite(l) || !isfinite(m)) {
-    for (int k = threadIdx.x; k < d; k += BLOCK_THREADS) gO(i, k) = 0.f;
-    if (threadIdx.x == 0) gL(i) = -CUDART_INF_F;
+    for (int k = threadIdx.x; k < d; k += BLOCK_THREADS) {
+      gO(i, k) = 0.f;
+    }
+    if (threadIdx.x == 0) {
+      gL(i) = -CUDART_INF_F;
+    }
     return;
   }
 
-  float inv_l = 1.f / l;
-  for (int k = threadIdx.x; k < d; k += BLOCK_THREADS) gO(i, k) *= inv_l;
-  if (threadIdx.x == 0) gL(i) = m + logf(l);
+  const float inv_l = 1.f / l;
+  for (int k = threadIdx.x; k < d; k += BLOCK_THREADS) {
+    gO(i, k) *= inv_l;
+  }
+
+  if (threadIdx.x == 0) {
+    gL(i) = m + logf(l);
+  }
 }

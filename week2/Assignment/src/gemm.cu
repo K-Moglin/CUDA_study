@@ -14,6 +14,7 @@ static void cuda_check(cudaError_t e, const char* msg) {
     }
 }
 
+// Transpose 
 // Row-major storage.
 // BLAS-like semantics:
 // op(A) is m x k
@@ -37,6 +38,8 @@ __device__ __forceinline__ float getB(const float* B, int k, int n, bool transB,
     return transB ? B[j * k + t] : B[t * n + j];
 }
 
+
+// Naive GEMM kernel with transpose support
 __global__ void gemm_kernel(
     int m, int n, int k,
     float alpha, const float* A, bool transA,
@@ -56,6 +59,8 @@ __global__ void gemm_kernel(
     C[row * n + col] = alpha * acc + beta * old;
 }
 
+
+// Reference CPU implementation for correctness checking
 static void cpu_gemm_ref(
     int m, int n, int k,
     float alpha, const float* A, bool transA,

@@ -25,38 +25,49 @@ __inline__ __device__ float warpReduceSum(float val) {
 }
 
 __inline__ __device__ float blockReduceMax(float val) {
-  __shared__ float shared[32]; // up to 1024 threads -> 32 warps
+  __shared__ float shared[32];
+  __shared__ float block_result;
+
   int lane = threadIdx.x & 31;
   int wid  = threadIdx.x >> 5;
+  int num_warps = (blockDim.x + 31) >> 5;
 
   val = warpReduceMax(val);
+
   if (lane == 0) shared[wid] = val;
   __syncthreads();
 
-  // final reduce in warp 0
-  float out = -CUDART_INF_F;
   if (wid == 0) {
-    out = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : -CUDART_INF_F;
+    float out = (lane < num_warps) ? shared[lane] : -CUDART_INF_F;
     out = warpReduceMax(out);
+    if (lane == 0) block_result = out;
   }
-  return __shfl_sync(0xffffffff, out, 0);
+  __syncthreads();
+
+  return block_result;
 }
 
 __inline__ __device__ float blockReduceSum(float val) {
   __shared__ float shared[32];
+  __shared__ float block_result;
+
   int lane = threadIdx.x & 31;
   int wid  = threadIdx.x >> 5;
+  int num_warps = (blockDim.x + 31) >> 5;  // 向上取整
 
   val = warpReduceSum(val);
+
   if (lane == 0) shared[wid] = val;
   __syncthreads();
 
-  float out = 0.f;
   if (wid == 0) {
-    out = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.f;
+    float out = (lane < num_warps) ? shared[lane] : 0.f;
     out = warpReduceSum(out);
+    if (lane == 0) block_result = out;
   }
-  return __shfl_sync(0xffffffff, out, 0);
+  __syncthreads();
+
+  return block_result;
 }
 
 // -------------------------
